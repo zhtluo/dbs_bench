@@ -15,7 +15,7 @@ pub type GT = <Bls12_381 as PairingEngine>::Fqk;
 
 pub type SecretKey = Scalar;
 pub type PublicKey = G1;
-pub type Secret = Scalar;
+pub type Secret = GT;
 pub type Share = G1;
 pub type Proof = G2;
 
@@ -37,21 +37,31 @@ where
 pub fn generate_shares<R>(
     n: usize,
     t: usize,
-    secret: Secret,
     public_keys: &[PublicKey],
     rng: &mut R,
-) -> (Vec<Share>, Vec<Proof>)
+) -> (Secret, Vec<Share>, Vec<Proof>)
 where
     R: Rng + ?Sized,
 {
+    let secret_scalar = Scalar::rand(rng);
     let vec: Vec<Scalar> = (0..t)
-        .map(|i| if i == 0 { secret } else { Scalar::rand(rng) })
+        .map(|i| {
+            if i == 0 {
+                secret_scalar
+            } else {
+                Scalar::rand(rng)
+            }
+        })
         .collect();
     let polynomial = Polynomial::from_coefficients_vec(vec);
     let evaluations: Vec<Scalar> = (0..n)
         .map(|i| polynomial.evaluate(&Scalar::from(i as u64 + 1)))
         .collect();
     (
+        Bls12_381::pairing(
+            G1::prime_subgroup_generator().mul(secret_scalar),
+            G2::prime_subgroup_generator(),
+        ),
         (0..n)
             .map(|i| public_keys[i].mul(evaluations[i]).into_affine())
             .collect(),
@@ -105,15 +115,17 @@ where
     }
     let vec: Vec<Scalar> = (0..n - t - 1).map(|_| Scalar::rand(rng)).collect();
     let polynomial = Polynomial::from_coefficients_vec(vec);
-    let codeword: Vec<Scalar> = (0..n)
-        .map(|i| {
-            let scalar_i = Scalar::from(i as u64 + 1);
-            (0..n)
-                .map(|j| {
+    let indices: Vec<_> = (0..n).map(|i| (i, Scalar::from(i as u64 + 1))).collect();
+    let codeword: Vec<Scalar> = indices
+        .iter()
+        .map(|&(i, scalar_i)| {
+            indices
+                .iter()
+                .map(|&(j, scalar_j)| {
                     if j == i {
                         Scalar::one()
                     } else {
-                        (scalar_i - Scalar::from(j as u64 + 1)).inverse().unwrap()
+                        (scalar_i - scalar_j).inverse().unwrap()
                     }
                 })
                 .fold(Scalar::one(), |v, x| v * x)
@@ -130,6 +142,46 @@ where
     Result::Ok(())
 }
 
+pub fn decrypt_share(secret_key: SecretKey, share: Share) -> Share {
+    share.mul(secret_key.inverse().unwrap()).into_affine()
+}
+
+pub fn verify_share(decrypted_share: Share, proof: Proof) -> Result<(), VerifyError> {
+    if Bls12_381::pairing(decrypted_share, G2::prime_subgroup_generator())
+        == Bls12_381::pairing(G1::prime_subgroup_generator(), proof)
+    {
+        Result::Ok(())
+    } else {
+        Result::Err(VerifyError::PairingDoesNotMatch)
+    }
+}
+
+pub fn reconstruct(n: usize, decrypted_shares: &[Option<Share>]) -> Secret {
+    let valid_share_indices: Vec<_> = (0..n)
+        .filter(|&i| decrypted_shares[i].is_some())
+        .map(|i| (i, Scalar::from(i as u64 + 1)))
+        .collect();
+    let secret = valid_share_indices
+        .iter()
+        .map(|&(i, scalar_i)| {
+            decrypted_shares[i].unwrap().mul(
+                valid_share_indices
+                    .iter()
+                    .map(|&(j, scalar_j)| {
+                        if j == i {
+                            Scalar::one()
+                        } else {
+                            scalar_j * (scalar_j - scalar_i).inverse().unwrap()
+                        }
+                    })
+                    .fold(Scalar::one(), |lambda, x| lambda * x),
+            )
+        })
+        .fold(G1::zero().into_projective(), |acc, x| acc + x)
+        .into_affine();
+    Bls12_381::pairing(secret, G2::prime_subgroup_generator())
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -143,7 +195,7 @@ mod tests {
         let rng = &mut std_rng();
         let keys: Vec<(SecretKey, PublicKey)> = (0..N).map(|_| generate_keypair(rng)).collect();
         let public_keys: Vec<PublicKey> = (0..N).map(|i| keys[i].1).collect();
-        let (shares, proof) = generate_shares(N, T, Scalar::rand(rng), &public_keys, rng);
+        let (_, shares, proof) = generate_shares(N, T, &public_keys, rng);
         let _: Vec<()> = (0..N)
             .map(|i| verify(N, T, i, public_keys[i], shares[i], &proof, rng).unwrap())
             .collect();
@@ -154,7 +206,7 @@ mod tests {
         let rng = &mut std_rng();
         let keys: Vec<(SecretKey, PublicKey)> = (0..N).map(|_| generate_keypair(rng)).collect();
         let public_keys: Vec<PublicKey> = (0..N).map(|i| keys[i].1).collect();
-        let (_, proof) = generate_shares(N, T, Scalar::rand(rng), &public_keys, rng);
+        let (_, _, proof) = generate_shares(N, T, &public_keys, rng);
         let _: Vec<VerifyError> = (0..N)
             .map(|i| {
                 verify(
@@ -172,5 +224,37 @@ mod tests {
                 .unwrap()
             })
             .collect();
+    }
+
+    #[test]
+    fn test_verify_share() {
+        let rng = &mut std_rng();
+        let keys: Vec<(SecretKey, PublicKey)> = (0..N).map(|_| generate_keypair(rng)).collect();
+        let public_keys: Vec<PublicKey> = (0..N).map(|i| keys[i].1).collect();
+        let (_, shares, proof) = generate_shares(N, T, &public_keys, rng);
+        let decrypted_shares: Vec<Share> = (0..N)
+            .map(|i| decrypt_share(keys[i].0, shares[i]))
+            .collect();
+        let _: Vec<()> = (0..N)
+            .map(|i| verify_share(decrypted_shares[i], proof[i]).unwrap())
+            .collect();
+        let _: Vec<VerifyError> = (1..N)
+            .map(|i| verify_share(decrypted_shares[i], proof[0]).err().unwrap())
+            .collect();
+    }
+
+    #[test]
+    fn test_reconstruct() {
+        let rng = &mut std_rng();
+        let keys: Vec<(SecretKey, PublicKey)> = (0..N).map(|_| generate_keypair(rng)).collect();
+        let public_keys: Vec<PublicKey> = (0..N).map(|i| keys[i].1).collect();
+        let (secret, shares, _) = generate_shares(N, T, &public_keys, rng);
+        let mut decrypted_shares: Vec<_> = (0..N)
+            .map(|i| Some(decrypt_share(keys[i].0, shares[i])))
+            .collect();
+        for i in 0..N - T {
+            decrypted_shares[i] = None;
+        }
+        assert_eq!(reconstruct(N, &decrypted_shares), secret);
     }
 }
