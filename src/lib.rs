@@ -30,7 +30,7 @@ where
     let secret = Scalar::rand(rng);
     (
         secret,
-        G1::prime_subgroup_generator().mul(secret).into_affine(),
+        G1::prime_subgroup_generator().mul(secret).into_affine(), //pk = g^s
     )
 }
 
@@ -55,7 +55,7 @@ where
         .collect();
     let polynomial = Polynomial::from_coefficients_vec(vec);
     let evaluations: Vec<Scalar> = (0..n)
-        .map(|i| polynomial.evaluate(&Scalar::from(i as u64 + 1)))
+        .map(|i| polynomial.evaluate(&Scalar::from(i as u64 + 1))) // Can be parallelized
         .collect();
     (
         Bls12_381::pairing(
@@ -72,6 +72,38 @@ where
                     .into_affine()
             })
             .collect(),
+    )
+}
+
+pub fn generate_rand_shares<R>(
+    n: usize,
+    t: usize,
+    public_keys: &[PublicKey],
+    rng: &mut R,
+) -> (Vec<Share>, Vec<Proof>)
+where
+    R: Rng + ?Sized,
+{
+    let vec: Vec<Scalar> = (0..t)
+        .map(|_i| {
+            Scalar::rand(rng)
+        })
+        .collect();
+    let polynomial = Polynomial::from_coefficients_vec(vec);
+    let evaluations: Vec<Scalar> = (0..n)
+        .map(|i| polynomial.evaluate(&Scalar::from(i as u64 + 1)))
+        .collect();
+    (
+        (0..n)
+            .map(|i| public_keys[i].mul(evaluations[i]).into_affine())
+            .collect(),// pk_i^{p(i)} for i in [n]
+        (0..n)
+            .map(|i| {
+                G2::prime_subgroup_generator()
+                    .mul(evaluations[i])
+                    .into_affine()
+            })
+            .collect(), // g^p(i) for i in [n]
     )
 }
 
@@ -96,22 +128,23 @@ impl Error for VerifyError {
     }
 }
 
-pub fn verify<R>(
+pub fn pverify<R>(
     n: usize,
     t: usize,
-    id: usize,
-    public_key: PublicKey,
-    share: Share,
+    public_key: &[PublicKey],
+    share: &[Share],
     proof: &[Proof],
     rng: &mut R,
 ) -> Result<(), VerifyError>
 where
     R: Rng + ?Sized,
 {
-    if Bls12_381::pairing(share, G2::prime_subgroup_generator())
-        != Bls12_381::pairing(public_key, proof[id])
-    {
-        return Result::Err(VerifyError::PairingDoesNotMatch);
+    for id in 0..n {
+        if Bls12_381::pairing(share[id], G2::prime_subgroup_generator())
+        != Bls12_381::pairing(public_key[id], proof[id]) // e(c_j, h) != e(pk, v_j)
+        {
+            return Result::Err(VerifyError::PairingDoesNotMatch);
+        }
     }
     let vec: Vec<Scalar> = (0..n - t - 1).map(|_| Scalar::rand(rng)).collect();
     let polynomial = Polynomial::from_coefficients_vec(vec);
@@ -196,9 +229,7 @@ mod tests {
         let keys: Vec<(SecretKey, PublicKey)> = (0..N).map(|_| generate_keypair(rng)).collect();
         let public_keys: Vec<PublicKey> = (0..N).map(|i| keys[i].1).collect();
         let (_, shares, proof) = generate_shares(N, T, &public_keys, rng);
-        let _: Vec<()> = (0..N)
-            .map(|i| verify(N, T, i, public_keys[i], shares[i], &proof, rng).unwrap())
-            .collect();
+        pverify(N, T, &public_keys, &shares, &proof, rng).unwrap()
     }
 
     #[test]
@@ -207,23 +238,21 @@ mod tests {
         let keys: Vec<(SecretKey, PublicKey)> = (0..N).map(|_| generate_keypair(rng)).collect();
         let public_keys: Vec<PublicKey> = (0..N).map(|i| keys[i].1).collect();
         let (_, _, proof) = generate_shares(N, T, &public_keys, rng);
-        let _: Vec<VerifyError> = (0..N)
-            .map(|i| {
-                verify(
+        let shares:Vec<_> = (0..N).map(|_i| {
+            G1::prime_subgroup_generator()
+            .mul(Scalar::rand(rng))
+            .into_affine()
+        }).collect();
+        let _: VerifyError = pverify(
                     N,
                     T,
-                    i,
-                    public_keys[i],
-                    G1::prime_subgroup_generator()
-                        .mul(Scalar::rand(rng))
-                        .into_affine(),
+                    &public_keys,
+                    &shares,
                     &proof,
                     rng,
                 )
                 .err()
-                .unwrap()
-            })
-            .collect();
+                .unwrap();
     }
 
     #[test]

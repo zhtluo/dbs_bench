@@ -27,6 +27,25 @@ pub fn dbs_generation(c: &mut Criterion) {
     group.finish();
 }
 
+pub fn dbs_rand_generation(c: &mut Criterion) {
+    let mut group = c.benchmark_group("dbs_rand_generation");
+    BenchmarkGroup::sampling_mode(&mut group, criterion::SamplingMode::Flat);
+    for &n in &TEST_POINTS {
+        let rng = &mut StdRng::seed_from_u64(SEED);
+        let t = (n + 1) / 2;
+        group.throughput(Throughput::Bytes(n as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
+            b.iter(|| {
+                let keys: Vec<(SecretKey, PublicKey)> =
+                    (0..n).map(|_| generate_keypair(rng)).collect();
+                let public_keys: Vec<PublicKey> = (0..n).map(|i| keys[i].1).collect();
+                generate_rand_shares(n, t, &public_keys, rng)
+            });
+        });
+    }
+    group.finish();
+}
+
 pub fn dbs_proof_verification(c: &mut Criterion) {
     let mut group = c.benchmark_group("dbs_proof_verification");
     BenchmarkGroup::sampling_mode(&mut group, criterion::SamplingMode::Flat);
@@ -35,13 +54,11 @@ pub fn dbs_proof_verification(c: &mut Criterion) {
         let t = (n + 1) / 2;
         let keys: Vec<(SecretKey, PublicKey)> = (0..n).map(|_| generate_keypair(rng)).collect();
         let public_keys: Vec<PublicKey> = (0..n).map(|i| keys[i].1).collect();
-        let (_, shares, proof) = generate_shares(n, t, &public_keys, rng);
+        let (shares, proof) = generate_rand_shares(n, t, &public_keys, rng);
         group.throughput(Throughput::Bytes(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             b.iter(|| {
-                (0..n)
-                    .map(|i| verify(n, t, i, public_keys[i], shares[i], &proof, rng).unwrap())
-                    .collect::<Vec<_>>()
+                pverify(n, t, &public_keys, &shares, &proof, rng).unwrap()
             });
         });
     }
@@ -118,5 +135,5 @@ pub fn dbs_combination(c: &mut Criterion) {
 criterion_group!(
     name = benches;
     config = Criterion::default().sample_size(BENCH_COUNT);
-    targets = dbs_generation, dbs_proof_verification, dbs_share_verification, dbs_reconstruction, dbs_combination);
+    targets = dbs_generation, dbs_rand_generation, dbs_proof_verification, dbs_share_verification, dbs_reconstruction, dbs_combination);
 criterion_main!(benches);
